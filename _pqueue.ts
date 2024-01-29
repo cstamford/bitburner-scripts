@@ -58,7 +58,7 @@
     }
 
     get(index: number) {
-        return this.queue[index];
+        return index >= this.head && index <= this.tail ? this.queue[index] : undefined;
     }
 
     peek() : T | undefined {

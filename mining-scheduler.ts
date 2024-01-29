@@ -1,532 +1,509 @@
 ﻿import {NetscriptPort, NS} from "@ns";
 import {
-    CoordinatorMetrics,
-    CoordinatorPortData,
     dispatch,
     get_durations,
     get_required_memory,
-    get_script_mem_cost, opBufferMs,
+    get_script_mem_cost,
+    make_empty_target_data,
     opDebug,
-    Operation,
-    OperationPortFinished,
-    OperationPortStarted,
-    OperationPortType,
-    OperationRegion, opMaxCount, opSpacerMs,
-    OpType,
-    read_message,
-    RegionState,
+    refresh_targets,
+    refresh_workers, SchedulerCommand, SchedulerCommandBudgets, SchedulerCommandType,
     transfer_scripts,
 } from "@/_mining";
 import {PriorityQueue} from "@/_pqueue";
-import {assert, cyan, get_server_memory, get_server_memory_max, get_time, magenta, next_prime_above} from "@/_util";
+import {assert, get_time, next_prime_above} from "@/_util";
+import {analyze, calculate_layout} from "@/_mining_analysis";
 import {
-    Analysis,
-    AnalysisThreads,
     AnalysisThreadTypes,
-    analyze,
-    calculate_layout,
-    format_analysis_threads,
-    reanalyze_for_cores
-} from "@/_mining_analysis";
+    OpType,
+    RegionState,
+    SchedulerRegion,
+    SchedulerTargetData,
+    SchedulerWorker
+} from "@/_shared";
 
-const coordinatorUpdateIntervalMs= 64;
+// bigger this number is, the more we can absorb level ups, thread jitter, frame spikes, etc
+// in exchange our job duration increases by jobSpawnAheadBufferMs (from perspective of memory, not from income)
+const jobSpawnAheadBufferMs = 512;
 
-// TODO: delays stop us from lowering for now. we can probably grab 10%-15% extra RAM by optimizing this delay.
-// we can solve it by keeping an incremental setTimeout rolling that dispatches jobs if we're full sec - this should cover any big gaps.
-const jobSpawnAheadBufferMs = Infinity;
+const opDebugUi = false;
+const opBufferMs = 1;
 
-interface PendingOperation extends Operation {
+interface PendingOperation {
+    threads: number,
     id: number;
     groupId: number;
-    region: OperationRegion;
-    threadsHome: number;
+    region: SchedulerRegion;
 
+    owner: Work;
     prev?: PendingOperation;
     next?: PendingOperation;
-    cancel?: () => void;
+
+    worker?: string;
+    cost?: number;
+    pid?: number;
 }
 
-interface Work {
-    target: string;
-    workers: string[];
+interface DebugUi {
+    container: HTMLDivElement;
+    divs: Map<string, HTMLDivElement>;
+}
 
+interface State {
     startTime: number;
 
-    portId: number;
-    portWorkerStartOpId: number;
-    portWorkerFinishOpId: number;
-    portWorkerFinishOpBarrierId: number;
+    workers: SchedulerWorker[];
+    targets: string[];
 
-    port: NetscriptPort,
-    portWorkerStartOp: NetscriptPort,
+    metricsPortRead: NetscriptPort,
+    metricsPortWrite: NetscriptPort,
+
+    portWorkerFinishOpId: number,
+    portWorkerFinishOpBarrierId: number,
+
     portWorkerFinishOp: NetscriptPort,
     portWorkerFinishOpBarrier: NetscriptPort,
 
-    analysis: Analysis,
-    analysisThreadsHome: AnalysisThreads,
-    analysisDurations: number[];
-    analysisLayout: Operation[];
-    analysisLayoutHome: Operation[];
-    analysisLayoutMemory: number;
-    analysisHackingSkill: number;
+    nextOperationsId: number;
+    nextMetricsTime: number;
+    nextServerUpdate: number;
 
     operationsLookup: Map<number, PendingOperation>;
-    operationsRegions: PriorityQueue<OperationRegion>;
-    operationsLaunches: PriorityQueue<PendingOperation>;
-    operationsIdNext: number;
-    operationsGroupIdNext: number;
-    operationsGroupStart: number;
+    workLookup: Map<string, Work>;
 
-    metrics: CoordinatorMetrics;
-    metricsTime: number;
+    debugUi?: DebugUi;
+}
+
+interface Work extends SchedulerTargetData {
+    operationsLaunches: PriorityQueue<PendingOperation>;
+    nextReanalysis: number;
+    nextOperationBatchEnd: number;
+    nextOperationsGroupId: number;
 }
 
 export async function main(ns: NS) {
     ns.disableLog("ALL");
 
-    const portId = ns.args[0] as number;
-    const portWorkerStartOpId = ns.args[1] as number;
-    const portWorkerFinishOpId = ns.args[2] as number;
-    const portWorkerFinishOpBarrierId = ns.args[3] as number;
-    const target = ns.args[4] as string;
-    const workers = ns.args.slice(5) as string[];
+    const basePortId = ns.pid * 6;
+    const readPortId = basePortId;
+    const writePortId = basePortId + 1;
+    const portWorkerFinishOpId = basePortId + 4;
+    const portWorkerFinishOpBarrierId = basePortId + 5;
 
-    for (const worker of workers) {
-        transfer_scripts(ns, worker);
-    }
+    ns.clearPort(readPortId);
+    ns.clearPort(writePortId);
+    ns.clearPort(portWorkerFinishOpId);
+    ns.clearPort(portWorkerFinishOpBarrierId);
 
-    while (ns.getServerSecurityLevel(target) != ns.getServerMinSecurityLevel(target)) {
-        const time = get_durations(ns, target)[OpType.Weaken];
-
-        for (const worker of workers) {
-            const threads = get_server_memory(ns, worker) / get_script_mem_cost(ns, OpType.Weaken);
-            dispatch(ns, OpType.Weaken, Math.floor(threads), worker, target); // shotgun that mofo
-        }
-
-        await ns.sleep(time + 1000);
-    }
-
-    const analysis = analyze(ns, target, opBufferMs, opSpacerMs);
-    const analysisThreadsHome = reanalyze_for_cores(ns, analysis, ns.getServer("home").cpuCores).threads;
-    const analysisDurations = get_durations(ns, target);
-    const analysisLayout = calculate_layout(analysis.threads, analysisDurations, analysis.bufferSize);
-    const analysisLayoutHome = calculate_layout(analysisThreadsHome, analysisDurations, analysis.bufferSize);
-
-    const work : Work = {
-        target,
-        workers,
-
+    const state: State = {
         startTime: get_time(),
+        workers: refresh_workers(ns),
+        targets: refresh_targets(ns),
 
-        portId,
-        portWorkerStartOpId,
+        metricsPortRead: ns.getPortHandle(readPortId),
+        metricsPortWrite: ns.getPortHandle(writePortId),
+
         portWorkerFinishOpId,
         portWorkerFinishOpBarrierId,
 
-        port: ns.getPortHandle(portId),
-        portWorkerStartOp: ns.getPortHandle(portWorkerStartOpId),
         portWorkerFinishOp: ns.getPortHandle(portWorkerFinishOpId),
         portWorkerFinishOpBarrier: ns.getPortHandle(portWorkerFinishOpBarrierId),
 
-        analysis: analysis,
-        analysisThreadsHome,
-        analysisDurations,
-        analysisLayout,
-        analysisLayoutHome,
-        analysisLayoutMemory: get_required_memory(ns, analysisLayout),
-        analysisHackingSkill: ns.getHackingLevel(),
+        nextOperationsId: 0,
+        nextMetricsTime: 0,
+        nextServerUpdate: 0,
 
         operationsLookup: new Map(),
-        operationsRegions: new PriorityQueue((a, b) => {
-            if (a.end != b.end) {
-                return a.end - b.end;
-            }
-
-            if (a.group != b.group) {
-                return a.group - b.group;
-            }
-
-            return a.groupOrder - b.groupOrder;
-        }),
-        operationsLaunches: new PriorityQueue((a, b) => a.region.start - b.region.start),
-        operationsIdNext: 0,
-        operationsGroupIdNext: 0,
-        operationsGroupStart: 0,
-
-        metrics: {
-            moneyPercent: 1,
-            securityFailures: 0,
-
-            activeJobs: 0,
-            totalJobs: 0,
-            oomJobs: 0,
-
-            activeBatches: 0,
-            totalBatches: 0,
-            oomBatches: 0,
-
-            realisedBatches: 0,
-            delayedBatches: 0,
-            cancelledBatches: 0,
-        },
-
-        metricsTime: -Infinity,
+        workLookup: new Map()
     };
 
-    await launch_initial_batch(ns, work);
+    for (const worker of state.workers) {
+        transfer_scripts(ns, worker.host);
+    }
+
+    if (opDebugUi) {
+        //state.debugUi = {container: create_ui(), divs: new Map<string, HTMLDivElement>()};
+    }
+
+    enter_pump_timeout_loop(ns, state);
 
     while (true) {
+        await state.portWorkerFinishOp.nextWrite();
+
+        while (!state.portWorkerFinishOp.empty()) {
+            const id = state.portWorkerFinishOp.read() as number;
+            await on_finish_operation(ns, state, state.operationsLookup.get(id)!);
+            state.portWorkerFinishOpBarrier.write(0);
+        }
+    }
+}
+
+function enter_pump_timeout_loop(ns: NS, state: State) {
+    setTimeout(async () => {
         const time = get_time();
 
-        if (work.portWorkerFinishOp.empty() && time >= work.metricsTime + coordinatorUpdateIntervalMs) {
-            const oldRegions = 4;
-            const regionTime = time - work.analysis.threads.stride * oldRegions
+        let reanalyzedOne = false;
 
-            while (!work.operationsRegions.is_empty()) {
-                if (regionTime < work.operationsRegions.peek()!.end) {
-                    break;
+        for (const target of state.targets) {
+            const work = get_target_work(ns, state, target);
+
+            const canAnalyze = check_security(ns, work) || !work.prepped || work.analysis.threads.type == AnalysisThreadTypes.Invalid;
+            const needsAnalyze = time >= work.nextReanalysis && !reanalyzedOne;
+
+            if (canAnalyze) {
+                set_work_durations(ns, work);
+
+                if (needsAnalyze) {
+                    reanalyzedOne = work.budget == 0 || ns.getHackingLevel() != work.analysisHackingSkill;
+
+                    if (reanalyzedOne) {
+                        set_work_analysis(ns, work);
+                        work.analysisHackingSkill = ns.getHackingLevel();
+                        work.nextReanalysis = time + (work.budget == 0 ? 60000 : 1000);
+                    }
                 }
-                work.operationsRegions.dequeue();
             }
 
-            const portData : CoordinatorPortData = {
-                metrics: work.metrics,
-                regions: work.operationsRegions.to_array().slice(0, 64)
-            };
+            if (work.budget == 0) {
+                work.strideForConcurrency = -1;
+                work.maxConcurrency = -1;
+                continue;
+            }
 
-            work.port.write(JSON.stringify(portData))
-            work.metricsTime = time;
+            const maxOpDuration = Math.max(...work.analysisLayout.map(x => x.time + x.duration)) * 2;
+            const maxTheoreticalConcurrency = maxOpDuration / (work.analysis.threads.stride + 1);
+            const normalizedBudget = work.budget / 100;
+            const maxConcurrencyWithinMemory = state.workers.reduce((a, x) => a + x.maxMem, 0) / (work.analysis.predictedMemory * (1 - normalizedBudget + 0.1));
+            const targetConcurrency = Math.min(maxTheoreticalConcurrency * normalizedBudget, maxConcurrencyWithinMemory);
+
+            work.strideForConcurrency = Math.floor(maxOpDuration / targetConcurrency);
+            work.maxConcurrency = Math.ceil(targetConcurrency);
+
+            try_schedule_next_batch(ns, state, work);
+            await launch_jobs(ns, state, work); // note: in practice, we do most of our launching via on_finish_operation
         }
 
-        await work.portWorkerFinishOp.nextWrite();
+        if (time >= state.nextMetricsTime) {
+            while (!state.metricsPortRead.empty()) {
+                const command = JSON.parse(state.metricsPortRead.read() as string) as SchedulerCommand;
+                if (command.type == SchedulerCommandType.Budget) {
+                    const budgets = command as SchedulerCommandBudgets;
+                    for (const budget of budgets.budgets) {
+                        const targetWork = get_target_work(ns, state, budget.target);
+                        targetWork.budget = budget.budget;
+                        targetWork.budgetMinHacks = budget.budgetMinHacks;
+                        targetWork.analysisHackingSkill = 0;
+                        targetWork.nextReanalysis = time;
+                    }
+                }
+            }
 
-        while (!work.portWorkerFinishOp.empty()) {
-            const message = read_message(work.portWorkerFinishOp);
-            assert(ns, message.type == OperationPortType.Finish, "expected OperationPortType.Finish");
-            await on_finish_operation(ns, work, work.operationsLookup.get(message.id)!, message as OperationPortFinished);
-            work.portWorkerFinishOpBarrier.write(0);
+            const data = Array.from(state.workLookup.values())
+                .map((work: Work) => {
+                    const {
+                        operationsLaunches, // skip launches
+                        ...targetData
+                    } = work;
+
+                    return targetData;
+                });
+
+            state.metricsPortWrite.write(JSON.stringify(data));
+            state.nextMetricsTime = time + 256;
         }
-    }
+
+        if (time >= state.nextServerUpdate) {
+            state.targets = refresh_targets(ns);
+
+            const newWorkers = refresh_workers(ns);
+            const existingWorkers = new Set(state.workers.map(x => x.host));
+
+            for (const worker of newWorkers) {
+                if (!existingWorkers.has(worker.host)) {
+                    transfer_scripts(ns, worker.host);
+                }
+            }
+
+            state.workers = refresh_workers(ns);
+            state.nextServerUpdate = time + 10000;
+        }
+
+        if (state.debugUi) {
+            //requestAnimationFrame(() => update_ui(
+            //    Array.from(state.operationsLookup.values()).flatMap(x => x.region),
+            //    state.debugUi!.container,
+            //    state.debugUi!.divs));
+        }
+
+        enter_pump_timeout_loop(ns, state);
+    }, next_prime_above(4));
 }
 
-function on_start_operation(ns: NS, work: Work, op: PendingOperation, message: OperationPortStarted) {
-    //ns.tprintf("%d %8s on_start_operation(.jobCreated: %d .delay: %d)", get_time(), OpType[op.type], message.jobCreated, message.delay);
-    op.region.jobCreated = message.jobCreated;
-
-    if (!check_security(ns, work)) {
-        ++work.metrics.securityFailures;
-    }
-
-    ++work.metrics.activeJobs;
-    ++work.metrics.totalJobs;
+function on_start_operation(ns: NS, state: State, op: PendingOperation) {
+    ++op.owner.metrics.activeJobs;
+    ++op.owner.metrics.totalJobs;
 
     if (!op.prev) {
-        ++work.metrics.activeBatches;
-        ++work.metrics.totalBatches;
+        ++op.owner.metrics.activeBatches;
+        ++op.owner.metrics.totalBatches;
     }
 }
 
-async function on_finish_operation(ns: NS, work: Work, op: PendingOperation, message: OperationPortFinished) {
-    //ns.tprintf("%d %8s on_finish_operation(.jobFinished: %d)", get_time(), OpType[op.type], message.jobFinished);
-    op.region.jobFinished = message.jobFinished;
-
-    --work.metrics.activeJobs;
+async function on_finish_operation(ns: NS, state: State, op: PendingOperation) {
+    --op.owner.metrics.activeJobs;
 
     if (!op.next) {
-        --work.metrics.activeBatches;
+        --op.owner.metrics.activeBatches;
 
         if (op.region.state == RegionState.Normal) {
-            ++work.metrics.realisedBatches;
-        } else if (op.region.state == RegionState.Delayed) {
-            ++work.metrics.realisedBatches;
-            ++work.metrics.delayedBatches;
+            ++op.owner.metrics.realisedBatches;
         } else if (op.region.state == RegionState.Cancelled) {
-            ++work.metrics.cancelledBatches;
+            ++op.owner.metrics.cancelledBatches;
         }
     }
 
-    if (op.type == OpType.Grow) {
-        const curMoney = ns.getServerMaxMoney(work.target);
-        const maxMoney = ns.getServerMoneyAvailable(work.target);
-        const percent = maxMoney / curMoney;
-        work.metrics.moneyPercent = percent * 0.001 + 0.999 * work.metrics.moneyPercent;
-    }
-
-    const fullSecurity = check_security(ns, work);
-
-    if (fullSecurity && ns.getHackingLevel() != work.analysisHackingSkill) {
-        reanalyze_work(ns, work);
-        work.analysisHackingSkill = ns.getHackingLevel();
-    }
-
-    if (op.type == OpType.Weaken && op.region.state != RegionState.Stabilization &&
-        (work.analysis.threads.type == AnalysisThreadTypes.Hgw || op.next?.type == OpType.Weaken)) {
-        try_schedule_next_batch(ns, work);
-    }
-
-    if (fullSecurity) {
-        while (!work.operationsLaunches.is_empty()) {
-            const next = work.operationsLaunches.peek()!;
-            if (message.jobFinished < next.region.start - jobSpawnAheadBufferMs) {
-                break;
+    if (op.region.type == OpType.Weaken) {
+        if (check_security(ns, op.owner)) {
+            if (op.region.state != RegionState.Padding) {
+                await launch_jobs(ns, state, op.owner);
             }
-            await try_dispatch_op(ns, work, work.operationsLaunches.dequeue()!);
+        } else {
+            ++op.owner.metrics.securityFailures;
         }
     }
 
-    if (op.region.state == RegionState.Stabilization) {
-        await try_dispatch_stabilization_weaken(ns,
-            work,
-            op.threads,
-            op.threadsHome,
-            message.jobFinished + next_prime_above(work.analysis.threads.stride),
-            work.analysisDurations[OpType.Weaken]);
+    if (op.region.type == OpType.Grow) {
+        const curMoney = ns.getServerMaxMoney(op.owner.target);
+        const maxMoney = ns.getServerMoneyAvailable(op.owner.target);
+        const percent = maxMoney / curMoney;
+        op.owner.metrics.money = percent * 0.01 + 0.99 * op.owner.metrics.money;
     }
 
-    work.operationsLookup.delete(op.id);
+    if (op.region.type == OpType.Weaken) {
+        const curSec = ns.getServerSecurityLevel(op.owner.target);
+        const minSec = ns.getServerMinSecurityLevel(op.owner.target);
+        const delta = curSec - minSec;
+        op.owner.metrics.security = delta * 0.01 + 0.99 * op.owner.metrics.security;
+    }
+
+    state.operationsLookup.delete(op.id);
+    state.workers.find(x => x.host == op.worker)!.mem += op.cost!;
 }
 
-// we launch all of the initial batches up front, which then keep themselves alive.
-// TODO: launch them progressively (probably via a bunch of setTimeouts) to save memory, so we can squeeze more into fewer servers
-async function launch_initial_batch(ns: NS, work: Work) {
-    const firstSetLast = work.startTime + Math.max(...work.analysisLayout.map(x => x.time + x.duration))
-    const theoreticalMaxBatches = (firstSetLast - work.startTime) / work.analysis.threads.stride;
-    const stabilizationEveryNBatch = 5;
+function try_schedule_next_batch(ns: NS, state: State, work: Work) {
+    const currentJobs = work.metrics.activeJobs + work.metrics.queuedJobs;
+    const time = get_time() + work.analysis.predictedTime;
 
-    let batchesAdded = 0;
-    let jobsAdded = 0;
-    let stabilizationJobsAdded = 0;
+    assert(ns, work.strideForConcurrency > 0, "stride must not be 0!");
 
-    work.operationsGroupStart = work.startTime + 512;
-    let stabilizationStart = work.operationsGroupStart;
-
-    while (work.operationsGroupStart < firstSetLast && jobsAdded < opMaxCount) {
-        if (!try_schedule_next_batch(ns, work)) {
-            break;
-        }
-
-        while (!work.operationsLaunches.is_empty()) {
-            await try_dispatch_op(ns, work, work.operationsLaunches.dequeue()!);
-            ++jobsAdded;
-        }
-
-        if (batchesAdded % 32 == 0) {
-            await ns.sleep(0);
-        }
-
-        if (stabilizationStart < firstSetLast && (++batchesAdded % stabilizationEveryNBatch) == 0) {
-            const idx = work.analysis.threads.type == AnalysisThreadTypes.Hwgw ? (stabilizationJobsAdded%2)*2 : 2;
-
-            await try_dispatch_stabilization_weaken(ns,
-                work,
-                work.analysisLayout[idx].threads,
-                work.analysisLayoutHome[idx].threads,
-                stabilizationStart,
-                work.analysisDurations[OpType.Weaken]);
-
-            stabilizationStart += next_prime_above(work.analysis.threads.stride) * stabilizationEveryNBatch;
-            ++stabilizationJobsAdded;
-        }
+    while (time - work.nextOperationBatchEnd >= 0) {
+        work.nextOperationBatchEnd += work.strideForConcurrency;
     }
 
-    ns.tprintf("[%s vs %s] %s %d initial batches, %d jobs, %d stabilization jobs, %.1f%% occupancy",
-        cyan("KatMiner"),
-        magenta(work.target),
-        format_analysis_threads(ns, work.analysis.threads),
-        batchesAdded,
-        jobsAdded,
-        stabilizationJobsAdded,
-        batchesAdded / theoreticalMaxBatches * 100);
-}
-
-function try_schedule_next_batch(ns: NS, work: Work) {
-    if (!try_get_worker(ns, work, work.analysisLayoutMemory)) {
-        ++work.metrics.oomBatches;
-        return false;
-    }
-
-    const time = get_time();
-    const minBufferSize = Math.max(64 /* thread jitter */, work.analysis.threads.stride);
-
-    while (work.operationsGroupStart < time + minBufferSize) {
-        work.operationsGroupStart += work.analysis.threads.stride;
+    if (jobSpawnAheadBufferMs + time < work.nextOperationBatchEnd) {
+        return;
     }
 
     const pendingOps: PendingOperation[] = work.analysisLayout.map(((x, i) => ({
         ...x,
-        id: work.operationsIdNext++,
-        groupId: work.operationsGroupIdNext,
-        threadsHome: work.analysisLayoutHome[i].threads,
+        id: state.nextOperationsId++,
+        groupId: work.nextOperationsGroupId,
+        owner: work,
         region: {
             type: x.type,
             state: RegionState.Normal,
-            group: work.operationsGroupIdNext,
+            group: work.nextOperationsGroupId,
             groupOrder: x.orderExecute,
-            start: work.operationsGroupStart + x.time,
-            end: work.operationsGroupStart + x.time + x.duration,
+            start: work.nextOperationBatchEnd + x.timeFromEnd - x.duration,
+            end: jobSpawnAheadBufferMs + work.nextOperationBatchEnd + x.timeFromEnd,
             jobCreated: 0,
             jobFinished: 0,
         }
     })));
 
-    const maxShifts = 100;
-    let shift = 0;
-    let shiftNum = 0;
-
-    while (true) {
-        let thisShift = 0;
-
-        for (const op of pendingOps) {
-            thisShift = Math.max(thisShift, delay_to_safe_region(ns, work, op.type, op.region.start + shift));
-        }
-
-        if (thisShift == 0 || ++shiftNum > maxShifts) {
-            break;
-        }
-
-        shift += thisShift + 0.1;
-    }
+    work.nextOperationBatchEnd += work.strideForConcurrency;
+    ++work.nextOperationsGroupId;
 
     for (let i = 0; i < pendingOps.length; ++i) {
         pendingOps[i].prev = pendingOps[i - 1];
         pendingOps[i].next = pendingOps[i + 1];
 
-        if (shift > 0) {
-            pendingOps[i].region.state = RegionState.Delayed;
-            pendingOps[i].region.start += shift;
-            pendingOps[i].region.end += shift;
-        }
-
-        work.operationsLookup.set(pendingOps[i].id, pendingOps[i]);
-        work.operationsRegions.enqueue(pendingOps[i].region);
+        state.operationsLookup.set(pendingOps[i].id, pendingOps[i]);
         work.operationsLaunches.enqueue(pendingOps[i]);
-        //ns.tprintf("%d %8s queued for %d (shift:%d)", time, OpType[pendingOps[i].type], pendingOps[i].region.start, shift)
+        ++work.metrics.queuedJobs;
     }
-
-    ++work.operationsGroupIdNext;
-    work.operationsGroupStart += work.analysis.threads.stride + shift;
 
     return true;
 }
 
-async function try_dispatch_op(ns: NS, work: Work, op: PendingOperation) {
-    const mem = get_script_mem_cost(ns, op.type) * op.threads;
-    const worker = try_get_worker(ns, work, mem);
+async function try_dispatch_op(ns: NS, state: State, op: PendingOperation) {
+    const sec = check_security(ns, op.owner);
+    const money = check_money(ns, op.owner);
+    op.owner.prepped = op.owner.prepped || (sec && money);
+
+    if (op.owner.prepped) {
+        if (op.groupId % 2 == 0) {
+            if (op.region.type == OpType.Hack && (!sec || op.owner.metrics.money <= 0.9)) {
+                op.region.state = RegionState.Cancelled;
+            }
+        }
+    } else if (sec) {
+        if (op.region.type == OpType.Hack) {
+            op.region.type = OpType.Grow;
+            op.region.state = RegionState.Padding;
+        }
+    } else {
+        op.region.type = OpType.Weaken;
+        op.region.state = RegionState.Padding;
+    }
+
+    const mem = get_script_mem_cost(ns, op.region.type) * op.threads;
+    const worker = try_get_worker(ns, state, op.region.type, mem);
 
     if (worker == undefined) {
-        ++work.metrics.oomJobs;
+        ++op.owner.metrics.oomJobs;
         return false;
     }
 
-    if (op.groupId % 2 == 0) {
-        if (op.type == OpType.Hack && (!check_security(ns, work) || work.metrics.moneyPercent <= 0.9)) {
-            op.region.state = RegionState.Cancelled;
-        } else if (op.type == OpType.Grow && work.analysisHackingSkill != ns.getHackingLevel()) {
-            op.region.state = RegionState.Cancelled;
+    op.worker = worker.host;
+    op.cost = mem;
+    op.pid = dispatch(ns,
+        op.region.type,
+        op.threads,
+        worker.host,
+        op.owner.target,
+        op.region.end,
+        op.owner.analysisDurations[op.region.type],
+        op.id,
+        state.portWorkerFinishOpId,
+        state.portWorkerFinishOpBarrierId,
+        op.region.state == RegionState.Cancelled || opDebug);
+
+    const success = op.pid != -1;
+
+    if (success) {
+        worker.mem -= mem;
+        on_start_operation(ns, state, op);
+
+        if (op.groupId % 5 == 0 && op.region.type != OpType.Hack) {
+            const end = op.region.end + next_prime_above(op.owner.strideForConcurrency);
+            await try_dispatch_padding(ns, state, op.owner, op.region.type, op.threads, end);
         }
     }
 
-    op.cancel = dispatch(ns,
-        op.type,
-        // TODO: Do we want to prioritise home for grows/weakens?
-        // TODO: I think we transition to a monolithic scheduler tbh
-        worker == "home" ? op.threadsHome : op.threads,
-        worker,
-        work.target,
-        op.region.end,
-        op.duration,
-        op.id,
-        work.portWorkerStartOpId,
-        work.portWorkerFinishOpId,
-        work.portWorkerFinishOpBarrierId,
-        op.region.state == RegionState.Cancelled || opDebug);
-
-    await work.portWorkerStartOp.nextWrite();
-
-    const message = read_message(work.portWorkerStartOp);
-    assert(ns, work.portWorkerStartOp.empty(), "portWorkerStartOp is not empty. This breaks our invariant.");
-    assert(ns, message.type == OperationPortType.Start, "expected OperationPortType.Start");
-
-    on_start_operation(ns, work, op, message as OperationPortStarted);
-
-    return true;
+    return success;
 }
 
-async function try_dispatch_stabilization_weaken(ns: NS, work: Work, threads: number, threadsHome: number, time: number, duration: number) {
-    if (!try_get_worker(ns, work, get_script_mem_cost(ns, OpType.Weaken) * threads)) {
+async function try_dispatch_padding(ns: NS, state: State, work: Work, type: OpType, threads: number, end: number) {
+    const mem = get_script_mem_cost(ns, type) * threads;
+    const worker = try_get_worker(ns, state, type, mem);
+
+    if (worker == undefined) {
         return false;
     }
 
-    const start = time;
-    const end = start + duration;
-
     const op: PendingOperation = {
-        type: OpType.Weaken,
-        time: 0,
-        duration,
         threads,
-        threadsHome,
-        orderDispatch: 0,
-        orderExecute: 0,
-        id: work.operationsIdNext++,
+        owner: work,
+        id: state.nextOperationsId++,
         groupId: -1,
         region: {
-            type: OpType.Weaken,
-            state: RegionState.Stabilization,
+            type: type,
+            state: RegionState.Padding,
             group: -1,
             groupOrder: 0,
-            start,
+            start: 0,
             end,
             jobCreated: 0,
             jobFinished: 0,
         }
     };
 
-    work.operationsLookup.set(op.id, op);
-    // doesn't get added to regions: we're invisible to all :)
-
-    return try_dispatch_op(ns, work, op);
+    state.operationsLookup.set(op.id, op);
+    return try_dispatch_op(ns, state, op);
 }
 
-function try_get_worker(ns: NS, work: Work, cost: number) {
-    let memory = work.workers.reduce((a, x) => a + get_server_memory(ns, x), 0)
-    return memory < cost ? undefined : work.workers
-        .map(x => ({server: x, memory: get_server_memory(ns, x)}))
-        .filter(x => x.memory >= cost)
-        .sort((a, b) => b.memory - a.memory)
-        .at(0)?.server;
+// TODO: lower core count for home for grows so we can save the memory
+function try_get_worker(ns: NS, state: State, opType: OpType, cost: number) {
+    const workersMem = state.workers
+        .filter(x => x.mem > cost)
+        .sort((a, b) => a.mem - b.mem);
+
+    if (opType == OpType.Grow) {
+        const home = workersMem.find(x => x.host == "home");
+        if (home) {
+            return home;
+        }
+    }
+
+    const best = workersMem.at(0);
+    return best?.host == "home" && workersMem.length > 1 ? workersMem.at(1) : best;
+}
+
+async function launch_jobs(ns: NS, state: State, work: Work) {
+    const time = get_time();
+
+    while (!work.operationsLaunches.is_empty()) {
+        const op = work.operationsLaunches.peek()!;
+        const launchTime = time - op.region.end + op.owner.analysisDurations[op.region.type];
+        const launch = launchTime + jobSpawnAheadBufferMs > 0;
+
+        let processed = false;
+
+        if (launch && (check_security(ns, op.owner) || launchTime > -16)) {
+            work.operationsLaunches.dequeue();
+            if (await try_dispatch_op(ns, state, op)) {
+                --op.owner.metrics.queuedJobs;
+                processed = true;
+            }
+        }
+
+        if (!processed) {
+            break;
+        }
+    }
 }
 
 function check_security(ns: NS, work: Work) {
-    const curSecurity = ns.getServerSecurityLevel(work.target);
-    const minSecurity = ns.getServerMinSecurityLevel(work.target);
-    return curSecurity == minSecurity;
+    const cur = ns.getServerSecurityLevel(work.target);
+    const min = ns.getServerMinSecurityLevel(work.target);
+    return cur == min;
 }
 
-function delay_to_safe_region(ns: NS, work: Work, opType: OpType, startTime: number) {
-    let idx = work.operationsRegions.search(<OperationRegion>{end: startTime});
-    let cur = work.operationsRegions.get(idx - 1);
-    let dist = 0;
+function check_money(ns: NS, work: Work) {
+    const cur = ns.getServerMoneyAvailable(work.target);
+    const max = ns.getServerMaxMoney(work.target);
+    return cur == max;
+}
 
-    while (cur)
-    {
-        if (cur.type == OpType.Weaken) {
-            return dist;
-        }
+function get_target_work(ns: NS, state: State, target: string) {
+    let work = state.workLookup.get(target);
 
-        cur = work.operationsRegions.get(idx++)
-        const distanceToTravel = cur.end - startTime;
-        dist += distanceToTravel;
+    if (!work) {
+        work = {
+            operationsLaunches: new PriorityQueue<PendingOperation>(
+                (a, b) => a.region.start - b.region.start),
+            nextReanalysis: 0,
+            nextOperationBatchEnd: 0,
+            nextOperationsGroupId: 0,
+            ...make_empty_target_data(ns, target),
+            analysisHackingSkill: ns.getHackingLevel(),
+            strideForConcurrency: -1,
+            maxConcurrency: -1,
+        };
+
+        state.workLookup.set(target, work);
     }
 
-    return dist;
+    return work;
 }
 
-function reanalyze_work(ns: NS, work: Work) {
-    work.analysis = analyze(ns, work.target, opBufferMs, opSpacerMs, work.analysis.threads.type);
-    work.analysisThreadsHome = reanalyze_for_cores(ns, work.analysis, ns.getServer("home").cpuCores).threads;
+function set_work_durations(ns: NS, work: Work) {
     work.analysisDurations = get_durations(ns, work.target);
+}
+
+function set_work_analysis(ns: NS, work: Work) {
+    work.analysis = analyze(ns, work.target, opBufferMs, 1, work.budgetMinHacks, work.budgetMaxHacks);
     work.analysisLayout = calculate_layout(work.analysis.threads, work.analysisDurations, work.analysis.bufferSize);
-    work.analysisLayoutHome = calculate_layout(work.analysisThreadsHome, work.analysisDurations, work.analysis.bufferSize);
     work.analysisLayoutMemory = get_required_memory(ns, work.analysisLayout);
 }

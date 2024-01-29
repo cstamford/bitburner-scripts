@@ -1,8 +1,6 @@
 ﻿import {NS} from "@ns";
 
-export const concurrentShareThreads = 100000;
-export const concurrentShareMemoryPerOne = 1.6 + 2.4;
-export const reservedMemoryOnHome = 64;
+export const reservedMemoryOnHome = 32;
 
 export const colors = {
     black: '\u001b[30m',
@@ -104,6 +102,42 @@ export async function run_async(ns: NS, script: string, threads: number, ...args
 export function get_all_hosts(ns: NS, withRoot = true) : string[] {
     const set : Set<string> = new Set();
     get_all_hosts_impl(ns, "home", set);
+
+    for (const host of set) {
+        if (!ns.hasRootAccess(host) && ns.getHackingLevel() >= ns.getServerRequiredHackingLevel(host)) {
+            let server = ns.getServer(host);
+
+            if (!server.sshPortOpen && ns.fileExists("BruteSSH.exe")) {
+                ns.brutessh(host);
+            }
+
+            if (!server.ftpPortOpen && ns.fileExists("FTPCrack.exe")) {
+                ns.ftpcrack(host);
+            }
+
+            if (!server.smtpPortOpen && ns.fileExists("relaySMTP.exe")) {
+                ns.relaysmtp(host);
+            }
+
+            if (!server.httpPortOpen && ns.fileExists("HTTPWorm.exe")) {
+                ns.httpworm(host);
+            }
+
+            if (!server.sqlPortOpen && ns.fileExists("SQLInject.exe")) {
+                ns.sqlinject(host);
+            }
+
+            server = ns.getServer(host);
+
+            let requiredPorts = server.numOpenPortsRequired!;
+            let openPorts = server.openPortCount!;
+
+            if (openPorts >= requiredPorts) {
+                ns.nuke(host);
+            }
+        }
+    }
+
     return [...set].filter(x => !withRoot || ns.hasRootAccess(x));
 }
 
@@ -134,6 +168,10 @@ export function get_server_memory_max(ns: NS, host: string) {
 }
 
 export function get_time() {
+    return performance.now(); //Date.now();
+}
+
+export function get_time_precise() {
     return performance.now();
 }
 

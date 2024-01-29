@@ -1,5 +1,5 @@
 ﻿import {NS, Server} from '@ns';
-import {get_all_hosts, green, magenta, red} from "@/_util";
+import {cyan, defaultc, get_all_hosts, green, magenta, red} from "@/_util";
 import {transfer_scripts} from "@/_mining";
 
 export async function main(ns: NS) {
@@ -20,6 +20,17 @@ export async function main(ns: NS) {
     }
 
     for (const path of backdoorable) {
+        for (let i = 0; i < path.length; ++i) {
+            if (path[i] == "CSEC" ||
+                path[i] == "avmnite-02h" ||
+                path[i] == "I.I.I.I" ||
+                path[i] == "run4theh111z" ||
+                path[i] == "w0r1d_d43m0n")
+            {
+                path[i] = cyan(path[i]);
+            }
+        }
+
         ns.tprintf("connect %s;", path.join(";connect "));
     }
 }
@@ -52,44 +63,6 @@ function shortest_path_to_server(ns: NS, server: string): string[] {
 }
 
 function log_server(ns: NS, indent: number, server: Server, closestServer: string) {
-    transfer_scripts(ns, server.hostname);
-
-    if (!server.hasAdminRights) {
-        let requiredHacking = server.requiredHackingSkill!;
-
-        if (ns.getPlayer().skills.hacking >= requiredHacking) {
-            if (!server.sshPortOpen && ns.fileExists("BruteSSH.exe")) {
-                ns.brutessh(server.hostname);
-            }
-
-            if (!server.ftpPortOpen && ns.fileExists("FTPCrack.exe")) {
-                ns.ftpcrack(server.hostname);
-            }
-
-            if (!server.smtpPortOpen && ns.fileExists("relaySMTP.exe")) {
-                ns.relaysmtp(server.hostname);
-            }
-
-            if (!server.httpPortOpen && ns.fileExists("HTTPWorm.exe")) {
-                ns.httpworm(server.hostname);
-            }
-
-            if (!server.sqlPortOpen && ns.fileExists("SQLInject.exe")) {
-                ns.sqlinject(server.hostname);
-            }
-
-            server = ns.getServer(server.hostname);
-
-            let requiredPorts = server.numOpenPortsRequired!;
-            let openPorts = server.openPortCount!;
-
-            if (openPorts >= requiredPorts) {
-                ns.nuke(server.hostname);
-                server = ns.getServer(server.hostname);
-            }
-        }
-    }
-
     let fullName = ns.sprintf("%s (%s)", magenta(server.hostname), server.ip);
     let indentString = ' '.repeat(indent * 2);
 

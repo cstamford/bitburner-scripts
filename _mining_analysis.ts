@@ -1,99 +1,31 @@
-﻿import {NS, Player, Server} from "@ns";
+﻿import {NS, Server} from "@ns";
 import {
     calculate_operation_order,
-    get_script_mem_cost,
-    OpType
+    get_script_mem_cost, opDebug,
 } from "@/_mining";
-
-const maxHackThreads = 65535;
-
-export enum AnalysisThreadTypes {
-    Hwgw,
-    Hgw
-}
-
-export interface AnalysisThreads {
-    type: AnalysisThreadTypes
-    stride: number
-}
-
-export interface AnalysisThreadsHwgw extends AnalysisThreads {
-    hacks: number;
-    weakensAfterHack: number;
-    grows: number;
-    weakensAfterGrow: number;
-}
-
-export interface AnalysisThreadsHgw extends AnalysisThreads {
-    hacks: number;
-    grows: number;
-    weakens: number;
-}
-
-export interface Analysis {
-    host: string,
-    score: number;
-    predictedTime: number;
-    predictedMemory: number;
-    predictedYield: number;
-    predictedYieldPercent: number;
-    threads: AnalysisThreads;
-    bufferSize: number;
-    spacerSize: number;
-    scoreFn: (ns: NS, pYield: number, pMem: number, pTime: number) => number;
-}
+import {Analysis, AnalysisThreads, AnalysisThreadsHgw, AnalysisThreadsHwgw, AnalysisThreadTypes, OpType} from "@/_shared";
 
 export function analyze(ns: NS,
     host: string,
     bufferSize: number,
-    spacerSize: number,
-    type: AnalysisThreadTypes | undefined = undefined,
     cores: number | undefined = undefined,
-    scoreFn: (ns: NS, pYield: number, pMem: number, pTime: number) => number = calculate_server_score) {
-    if (ns.fileExists("Formulas.exe", "home")) {
-        let analysis = analyze_hwgw(ns, host, 1, bufferSize, spacerSize, cores, scoreFn);
-
-        for (let i = 2; i < maxHackThreads; ++i) {
-            const candidates: Analysis[] = [
-                analyze_hwgw(ns, host, i, bufferSize, spacerSize, cores, scoreFn),
-                analyze_hgw(ns, host, i, bufferSize, spacerSize, cores, scoreFn)
-            ];
-
-            const candidate = candidates
-                .filter(x => !type || type == x.threads.type)
-                .filter(x => x.score > analysis.score)
-                .sort((a, b) => b.score - a.score)
-                .at(0);
-
-            if (candidate) {
-                analysis = candidate;
-            } else {
-                break;
-            }
-        }
-
-        return analysis;
-    }
-
-    return estimate_hgw(ns, host, bufferSize, spacerSize, cores, scoreFn);
-}
-
-export function reanalyze_for_cores(ns: NS, prev: Analysis, cores: number) {
-    if (!ns.fileExists("Formulas.exe", "home")) {
-        return prev;
-    }
-
+    minHacks: number = 1,
+    maxHacks: number = 256) {
     let analysis: Analysis | undefined = undefined;
 
-    for (let i = 1; i < maxHackThreads; ++i) {
+    ns.tprintf("Analysis %s", host);
+    for (let i = minHacks; i <= maxHacks; ++i) {
         const candidates: Analysis[] = [
-            analyze_hwgw(ns, prev.host, i, cores, prev.bufferSize, prev.spacerSize, prev.scoreFn),
-            analyze_hgw(ns, prev.host, i, cores, prev.bufferSize, prev.spacerSize, prev.scoreFn)
+            analyze_hwgw(ns, host, i, bufferSize, cores),
+            analyze_hgw(ns, host, i, bufferSize, cores)
         ];
 
-        const candidate = candidates.find(x => prev.threads.type == x.threads.type);
+        const candidate = candidates
+            .filter(x => x.score > (analysis?.score ?? 0))
+            .sort((a, b) => b.score - a.score)
+            .at(0);
 
-        if ((candidate?.predictedMemory || 0) <= prev.predictedMemory) {
+        if (candidate) {
             analysis = candidate;
         } else {
             break;
@@ -108,9 +40,7 @@ export function analyze_hwgw(
     host: string,
     hacks: number,
     bufferSize: number,
-    spacerSize: number,
-    cores: number | undefined,
-    scoreFn: (ns: NS, pYield: number, pMem: number, pTime: number) => number) : Analysis {
+    cores: number | undefined) : Analysis {
     const server = init_server(ns, host);
     const player = ns.getPlayer();
 
@@ -123,7 +53,7 @@ export function analyze_hwgw(
 
     const threads: AnalysisThreadsHwgw = {
         type: AnalysisThreadTypes.Hwgw,
-        stride: bufferSize * 4 + spacerSize,
+        stride: bufferSize * 4,
         hacks,
         weakensAfterHack,
         grows,
@@ -131,26 +61,25 @@ export function analyze_hwgw(
     };
 
     const predictedTime = Math.max(
-        Math.ceil(ns.formulas.hacking.growTime(server, player)),
-        Math.ceil(ns.formulas.hacking.weakenTime(server, player)),
-        Math.ceil(ns.formulas.hacking.hackTime(server, player)),
+        Math.ceil(ns.formulas.hacking.growTime(server, player) / (opDebug ? 8 : 1)),
+        Math.ceil(ns.formulas.hacking.weakenTime(server, player) / (opDebug ? 8 : 1)),
+        Math.ceil(ns.formulas.hacking.hackTime(server, player) / (opDebug ? 8 : 1)),
     );
 
-    const predictedMemory = calculate_threads_memory(ns, threads);
+    const threadsMemory = calculate_threads_memory(ns, threads);
     const predictedYield = server.moneyMax! * hackAmount * ns.formulas.hacking.hackChance(server, player);
     const predictedYieldPercent = hackAmount;
 
     return {
         host,
-        score: scoreFn(ns, predictedYield, predictedMemory, predictedTime),
+        score: calculate_server_score(ns, predictedYield, threadsMemory.total, predictedTime),
         predictedTime,
-        predictedMemory,
+        predictedMemory: threadsMemory.total,
+        predictedMemoryPeak: threadsMemory.peak,
         predictedYield,
         predictedYieldPercent,
         threads,
-        bufferSize,
-        spacerSize,
-        scoreFn
+        bufferSize
     };
 }
 
@@ -159,9 +88,7 @@ export function analyze_hgw(
     host: string,
     hacks: number,
     bufferSize: number,
-    spacerSize: number,
-    cores: number | undefined,
-    scoreFn: (ns: NS, pYield: number, pMem: number, pTime: number) => number) : Analysis {
+    cores: number | undefined) : Analysis {
     const server = init_server(ns, host);
     const player = ns.getPlayer();
 
@@ -177,79 +104,32 @@ export function analyze_hgw(
 
     const threads: AnalysisThreadsHgw = {
         type: AnalysisThreadTypes.Hgw,
-        stride: bufferSize * 3 + spacerSize,
+        stride: bufferSize * 3,
         hacks,
         grows,
         weakens
     };
 
     const predictedTime = Math.max(
-        Math.ceil(ns.formulas.hacking.growTime(server, player)),
-        Math.ceil(ns.formulas.hacking.weakenTime(server, player)),
-        Math.ceil(ns.formulas.hacking.hackTime(server, player)),
+        Math.ceil(ns.formulas.hacking.growTime(server, player) / (opDebug ? 8 : 1)),
+        Math.ceil(ns.formulas.hacking.weakenTime(server, player) / (opDebug ? 8 : 1)),
+        Math.ceil(ns.formulas.hacking.hackTime(server, player) / (opDebug ? 8 : 1)),
     );
 
-    const predictedMemory = calculate_threads_memory(ns, threads);
+    const threadsMemory = calculate_threads_memory(ns, threads);
     const predictedYield = server.moneyMax! * hackAmount * ns.formulas.hacking.hackChance(server, player);
     const predictedYieldPercent = hackAmount;
 
     return {
         host,
-        score: scoreFn(ns, predictedYield, predictedMemory, predictedTime),
+        score: calculate_server_score(ns, predictedYield, threadsMemory.total, predictedTime),
         predictedTime,
-        predictedMemory,
+        predictedMemory: threadsMemory.total,
+        predictedMemoryPeak: threadsMemory.peak,
         predictedYield,
         predictedYieldPercent,
         threads,
-        bufferSize,
-        spacerSize,
-        scoreFn
-    };
-}
-
-// for n00dles! (pre BN for formulas)
-export function estimate_hgw(
-    ns: NS,
-    host: string,
-    bufferSize: number,
-    spacerSize: number,
-    cores: number | undefined,
-    scoreFn: (ns: NS, pYield: number, pMem: number, pTime: number) => number) : Analysis {
-
-    let hacks = 8;
-    let grows = 1;
-    let weakens = 1;
-
-    const threads: AnalysisThreadsHgw = {
-        type: AnalysisThreadTypes.Hgw,
-        stride: bufferSize * 3 + spacerSize,
-        hacks,
-        grows,
-        weakens
-    };
-
-    const predictedTime = Math.max(
-        Math.ceil(ns.getGrowTime(host)),
-        Math.ceil(ns.getWeakenTime(host)),
-        Math.ceil(ns.getHackTime(host)),
-    );
-
-    const predictedMemory = calculate_threads_memory(ns, threads);
-    const hackAmount = ns.hackAnalyze(host) * hacks;
-    const predictedYield = ns.getServerMaxMoney(host) * hackAmount * ns.hackAnalyzeChance(host);
-    const predictedYieldPercent = hackAmount;
-
-    return {
-        host,
-        score: scoreFn(ns, predictedYield, predictedMemory, predictedTime),
-        predictedTime,
-        predictedMemory,
-        predictedYield,
-        predictedYieldPercent,
-        threads,
-        bufferSize,
-        spacerSize,
-        scoreFn
+        bufferSize
     };
 }
 
@@ -267,12 +147,17 @@ export function init_server(ns: NS, host: string) : Server {
     return server;
 }
 
-export function calculate_weaken_threads(ns: NS, delta: number, cores: number | undefined) {
+export function calculate_weaken_threads(ns: NS, delta: number, cores: number | undefined = undefined) {
     let threads = 1;
-    while (ns.weakenAnalyze(threads, cores) <= delta) {
+    while (ns.weakenAnalyze(threads, cores) <= (delta + 0.02)) {
         ++threads;
     }
-    return threads + 1;
+    return threads;
+}
+
+export function calculate_weakens_for_prep(ns: NS, host: string) {
+    const secDelta = ns.getServerSecurityLevel(host) - ns.getServerMinSecurityLevel(host);
+    return calculate_weaken_threads(ns, secDelta);
 }
 
 export function calculate_layout(threads: AnalysisThreads, durations: number[], bufferSize: number) {
@@ -303,38 +188,26 @@ export function calculate_hgw(threads: AnalysisThreadsHgw, durations: number[], 
 }
 
 export function calculate_server_score(ns: NS, predictedYield: number, predictedMemory: number, predictedTime: number) {
-    return predictedYield / Math.pow(predictedMemory, 0.8) / predictedTime;
-}
-
-export function format_analysis_threads(ns: NS, threads: AnalysisThreads) {
-    if (threads.type == AnalysisThreadTypes.Hwgw) {
-        const hwgw = threads as AnalysisThreadsHwgw;
-        return ns.sprintf("hwgw%d-%d/%d/%d/%d", hwgw.stride, hwgw.hacks, hwgw.weakensAfterHack, hwgw.grows, hwgw.weakensAfterGrow);
-    }
-
-    if (threads.type == AnalysisThreadTypes.Hgw) {
-        const hgw = threads as AnalysisThreadsHgw;
-        return ns.sprintf("hgw%d-%d/%d/%d", hgw.stride, hgw.hacks, hgw.grows, hgw.weakens);
-    }
-
-    return "";
+    return predictedYield / predictedMemory / predictedTime;
 }
 
 export function calculate_threads_memory(ns: NS, threads: AnalysisThreads) {
     if (threads.type == AnalysisThreadTypes.Hwgw) {
         const hwgw = threads as AnalysisThreadsHwgw;
-        return get_script_mem_cost(ns, OpType.Hack) * hwgw.hacks +
-            get_script_mem_cost(ns, OpType.Weaken) * hwgw.weakensAfterHack +
-            get_script_mem_cost(ns, OpType.Grow) * hwgw.grows +
-            get_script_mem_cost(ns, OpType.Weaken) * hwgw.weakensAfterGrow;
+        const h = get_script_mem_cost(ns, OpType.Hack) * hwgw.hacks;
+        const w1 = get_script_mem_cost(ns, OpType.Weaken) * hwgw.weakensAfterHack;
+        const g = get_script_mem_cost(ns, OpType.Grow) * hwgw.grows;
+        const w2 = get_script_mem_cost(ns, OpType.Weaken) * hwgw.weakensAfterGrow;
+        return { total: h + w1 + g + w2, peak: Math.max(h, w1, g, w2) };
     }
 
     if (threads.type == AnalysisThreadTypes.Hgw) {
         const hgw = threads as AnalysisThreadsHgw;
-        return get_script_mem_cost(ns, OpType.Hack) * hgw.hacks +
-            get_script_mem_cost(ns, OpType.Grow) * hgw.grows +
-            get_script_mem_cost(ns, OpType.Weaken) * hgw.weakens;
+        const h = get_script_mem_cost(ns, OpType.Hack) * hgw.hacks;
+        const g = get_script_mem_cost(ns, OpType.Grow) * hgw.grows;
+        const w = get_script_mem_cost(ns, OpType.Weaken) * hgw.weakens;
+        return { total: h + g + w, peak: Math.max(h, g, w) };
     }
 
-    return -1;
+    return { total: -1, peak: -1 };
 }

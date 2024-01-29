@@ -1,7 +1,6 @@
 ﻿import {get_overview_box_rect, get_terminal_rect} from "@/_layout";
-import {get_time, money} from "@/_util";
-import {CoordinatorMetrics, OperationRegion, OpType, RegionState} from "@/_mining";
-import {Analysis} from "@/_mining_analysis";
+import {get_time} from "@/_util";
+import {OpType, RegionState, SchedulerRegion} from "@/_shared";
 
 export function create_ui() {
     const terminalRect = get_terminal_rect();
@@ -11,77 +10,19 @@ export function create_ui() {
     container.style.position = "fixed";
     container.style.left = `${terminalRect.x}px`;
     container.style.width = `${overviewRect.x - terminalRect.x}px`;
+    container.style.height = "600px"
     container.style.background = "rgba(20, 20, 20, 0.95)";
     container.style.border = "1px solid rgba(255, 255, 255, 0.15)";
     container.style.boxShadow = "0px 0px 12px rgba(0, 0, 0, 0.5)";
     container.style.borderRadius = "4px";
     container.style.padding = "10px";
+    container.style.overflow = "hidden";
 
     document.getElementById("root")!.appendChild(container);
     return container;
 }
 
-export function create_ui_metrics(container: HTMLDivElement, targets: string[]) {
-    const table = document.createElement("table");
-    table.id = 'metricsTable';
-    table.style.width = "100%";
-    table.style.borderCollapse = "collapse";
-    table.style.fontSize = "9px";
-    table.style.color = "#FFF";
-    table.style.fontFamily = "'Orbitron', monospace";
-    table.style.letterSpacing = "1px";
-
-    const headerRow = table.insertRow();
-
-    const headers = [
-        "",
-        "Profit",
-        "Active",
-        "Total",
-        "Realised",
-        "Delayed",
-        "Cancelled",
-        "Money %",
-        "Sec Failures",
-        "OOM Jobs",
-        "OOM Batches"
-    ];
-
-    headers.forEach((headerText, index) => {
-        let headerCell = document.createElement("th");
-        headerCell.textContent = headerText;
-        if (index == 0) {
-            headerCell.style.visibility = "hidden";
-        } else {
-            headerCell.style.padding = "2px";
-        }
-        headerRow.appendChild(headerCell);
-    });
-
-    targets.forEach((target, index) => {
-        let row = table.insertRow();
-        row.id = `metricsRow-${index}`;
-        for (let i = 0; i < headers.length; i++) {
-            let cell = row.insertCell();
-            cell.style.padding = "2px";
-            cell.style.textAlign = "center";
-
-            if (i != targets.length - 1) {
-                cell.style.borderRight = "1px solid rgba(255, 255, 255, 0.05)";
-            }
-
-            if (i == 0) {
-                cell.textContent = target;
-                cell.style.fontWeight = "bold";
-                cell.style.color = "magenta";
-            }
-        }
-    });
-
-    container.appendChild(table);
-}
-
-export function update_ui(regions: OperationRegion[], container: HTMLDivElement, divs: Map<string, HTMLDivElement>) {
+export function update_ui(regions: SchedulerRegion[], container: HTMLDivElement, divs: Map<string, HTMLDivElement>) {
     const time = get_time();
     const regionIdsInUse = new Set(regions.map(r => `group-${r.group}-order-${r.groupOrder}`));
 
@@ -119,14 +60,8 @@ export function update_ui(regions: OperationRegion[], container: HTMLDivElement,
     const minOrder = Math.min(...regions.map(x => x.groupOrder));
 
     let drawnNum = 0;
-    let nextNeedsStabilization = false;
 
     regions.forEach((region, i) => {
-        if (region.state == RegionState.Stabilization) {
-            nextNeedsStabilization = true;
-            return;
-        }
-
         const spawnOffset = time - region.jobCreated;
         const startOffset = time - region.start;
         const endOffset = time - region.end;
@@ -140,6 +75,10 @@ export function update_ui(regions: OperationRegion[], container: HTMLDivElement,
         const spawnWidth = start - spawn;
         const regionWidth = end - start;
         const despawnWidth = Math.max(0, despawn - end);
+
+        if (regionWidth == 0) {
+            return;
+        }
 
         const regionId = `group-${region.group}-order-${region.groupOrder}`;
 
@@ -210,12 +149,12 @@ export function update_ui(regions: OperationRegion[], container: HTMLDivElement,
         const enableOutOfOrderViz: boolean = true;
 
         const inOrderBack = !enableOutOfOrderViz || i == 0 ||
-            regions[i-1].state == RegionState.Stabilization ||
+            regions[i-1].state == RegionState.Padding ||
             (region.groupOrder == minOrder && regions[i-1].group == region.group - 1) ||
             (region.groupOrder != minOrder && regions[i-1].groupOrder == region.groupOrder - 1);
 
         const inOrderFront = !enableOutOfOrderViz || i == regions.length - 1 ||
-            regions[i+1].state == RegionState.Stabilization ||
+            regions[i+1].state == RegionState.Padding ||
             (region.groupOrder == maxOrder && regions[i+1].group == region.group + 1) ||
             (region.groupOrder != maxOrder && regions[i+1].groupOrder == region.groupOrder + 1);
 
@@ -231,10 +170,7 @@ export function update_ui(regions: OperationRegion[], container: HTMLDivElement,
             regionBox.style.backgroundColor = "transparent";
         }
 
-        if (region.state == RegionState.Delayed) {
-            regionBox.style.border = "2px inset";
-            regionBox.style.borderColor = "#ffcc00";
-        } else if (region.state == RegionState.Cancelled) {
+        if (region.state == RegionState.Cancelled) {
             regionBox.style.border = "2px inset";
             regionBox.style.borderColor = "#ff0900";
         }
@@ -246,8 +182,8 @@ export function update_ui(regions: OperationRegion[], container: HTMLDivElement,
             regionBox.style.visibility = "visible";
         }
 
-        if (time > region.end) {
-            regionBox.style.opacity = '0.5';
+        if (region.start == 0 || time > region.end) {
+            regionBox.style.opacity = '0.33';
         } else {
             regionBox.style.opacity = '1.0';
         }
@@ -272,27 +208,4 @@ export function update_ui(regions: OperationRegion[], container: HTMLDivElement,
     }
 
     container.appendChild(timeLine);
-}
-
-export function update_metrics_ui(workerIdx: number, startTime: number, analysis: Analysis, metrics: CoordinatorMetrics) {
-    const totalTime = get_time() - startTime;
-    const totalMoney = metrics.realisedBatches * analysis.predictedYield;
-    const moneyPerMsec = totalMoney / totalTime;
-
-    const row = document.getElementById(`metricsRow-${workerIdx}`) as HTMLTableRowElement;
-    if (row) {
-        row.cells[1].textContent = `${money(moneyPerMsec*1000)}/sec`;
-        row.cells[2].textContent = `${metrics.activeJobs}`;
-        row.cells[3].textContent = `${metrics.totalJobs}`;
-        row.cells[4].textContent = `${metrics.realisedBatches}`;
-        row.cells[5].textContent = `${metrics.delayedBatches}`;
-        row.cells[6].textContent = `${metrics.cancelledBatches}`;
-        row.cells[7].textContent = `${(metrics.moneyPercent * 100).toFixed(2)}`;
-        row.cells[8].textContent = `${metrics.securityFailures}`;
-        row.cells[9].textContent = `${metrics.oomJobs}`;
-        row.cells[10].textContent = `${metrics.oomBatches}`;
-    }
-
-    let metricsTable = document.getElementById('metricsTable')!;
-    metricsTable.parentElement?.appendChild(metricsTable);
 }

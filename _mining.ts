@@ -1,82 +1,26 @@
-﻿import {NetscriptPort, NS} from "@ns";
-import {red} from "@/_util";
+﻿import {NS} from "@ns";
+import {get_all_controllable_hosts, get_all_hosts, get_server_memory, get_server_memory_max, red} from "@/_util";
+import {
+    AnalysisThreadTypes,
+    Operation,
+    OpType,
+    SchedulerTargetBudget,
+    SchedulerTargetData,
+    SchedulerWorker
+} from "@/_shared";
 
 export const opDebug = false;
-export const opBufferMs = 1; // between operations within schedules
-export const opSpacerMs = 2;
-export const opMaxCount = 200000;
 
-export enum OpType {
-    Grow,
-    Weaken,
-    Hack
+export enum SchedulerCommandType {
+    Budget
 }
 
-export interface Operation {
-    type: OpType;
-    time: number;
-    duration: number;
-    threads: number;
-    orderDispatch: number;
-    orderExecute: number;
+export interface SchedulerCommand {
+    type: SchedulerCommandType;
 }
 
-export enum RegionState {
-    Normal,
-    Delayed,
-    Cancelled,
-    Stabilization,
-}
-
-export interface OperationRegion {
-    type: OpType;
-    state: RegionState;
-    group: number;
-    groupOrder: number;
-    start: number;
-    end: number;
-    jobCreated: number;
-    jobFinished: number;
-}
-
-export enum OperationPortType {
-    Start,
-    Finish,
-}
-
-export interface OperationPort {
-    type: OperationPortType;
-    id: number;
-}
-export interface OperationPortStarted extends OperationPort {
-    jobCreated: number;
-    delay: number;
-}
-
-export interface OperationPortFinished extends OperationPort {
-    jobFinished: number;
-}
-
-export interface CoordinatorMetrics {
-    moneyPercent: number;
-    securityFailures: number;
-
-    activeJobs: number;
-    totalJobs: number;
-    oomJobs: number;
-
-    activeBatches: number;
-    totalBatches: number;
-    oomBatches: number;
-
-    realisedBatches: number;
-    delayedBatches: number;
-    cancelledBatches: number;
-}
-
-export interface CoordinatorPortData {
-    regions: OperationRegion[];
-    metrics: CoordinatorMetrics;
+export interface SchedulerCommandBudgets extends SchedulerCommand {
+    budgets: SchedulerTargetBudget[];
 }
 
 export function calculate_operation_order(descriptors: {type: OpType, time: number, threads: number}[], bufferSize: number): Operation[] {
@@ -92,18 +36,20 @@ export function calculate_operation_order(descriptors: {type: OpType, time: numb
 
         schedule.push({
             type: indexedOp.op.type,
+            time: startTime,
+            timeFromEnd: 0,
             duration: indexedOp.op.time,
             threads: indexedOp.op.threads,
             orderExecute: indexedOp.index,
             orderDispatch: schedule.length,
-            time: startTime
         });
     }
 
     const firstDispatchedOrder = schedule[0].orderExecute;
 
     for (const orderedOp of schedule) {
-        orderedOp.time = orderedOp.time + (orderedOp.orderExecute - firstDispatchedOrder) * bufferSize;
+        orderedOp.timeFromEnd = (orderedOp.orderExecute - firstDispatchedOrder) * bufferSize;
+        orderedOp.time += orderedOp.timeFromEnd;
     }
 
     return schedule;
@@ -114,12 +60,12 @@ export function dispatch(ns: NS, op: OpType, threads: number, runner: string, ta
     const pid = ns.exec(script, runner, {threads:threads, temporary:true}, target, ...data);
 
     if (pid == 0) {
-        ns.tprintf(red("Failed to start %s [%s] on %s (target:%s)"), script, data, runner, target);
+        const maxMem = ns.getServerMaxRam(runner);
+        const mem = ns.getServerUsedRam(runner)
+        ns.tprintf(red("Failed to start %s [%s] on %s (target:%s, %d/%dgb)"), script, data, runner, target, mem, maxMem);
     }
 
-    return () => {
-        ns.kill(script, runner, target, ...data);
-    };
+    return pid;
 }
 
 export function get_required_memory(ns: NS, ops: Operation[]) {
@@ -169,20 +115,60 @@ export function transfer_scripts(ns: NS, host: string) {
     ns.scp(ns.ls("home", ".js"), host, "home");
 }
 
-export function write_message(port: NetscriptPort, message: OperationPort) {
-    port.write(JSON.stringify(message));
+export function make_empty_target_data(ns: NS, target: string) : SchedulerTargetData {
+    const maxMoney = ns.getServerMaxMoney(target);
+
+    return {
+        target,
+        prepped: false,
+        budget: 0,
+        budgetMinHacks: 1,
+        budgetMaxHacks: 255,
+        analysis: {
+            host: target,
+            score: 0,
+            predictedTime: 0,
+            predictedMemory: 0,
+            predictedMemoryPeak: 0,
+            predictedYield: 0,
+            predictedYieldPercent: 0,
+            threads: {
+                type: AnalysisThreadTypes.Invalid,
+                stride: -1,
+            },
+            bufferSize: 0
+        },
+        analysisDurations: [],
+        analysisLayout: [],
+        analysisLayoutMemory: 0,
+        analysisHackingSkill: 0,
+        strideForConcurrency: -1,
+        maxConcurrency: -1,
+        metrics: {
+            money: maxMoney == 0 ? 0 : ns.getServerMoneyAvailable(target) / maxMoney,
+            security: ns.getServerSecurityLevel(target) - ns.getServerMinSecurityLevel(target),
+            securityFailures: 0,
+            activeJobs: 0,
+            queuedJobs: 0,
+            totalJobs: 0,
+            oomJobs: 0,
+            activeBatches: 0,
+            totalBatches: 0,
+            realisedBatches: 0,
+            cancelledBatches: 0
+        }
+    };
 }
 
-export function write_message_started(port: NetscriptPort, id: number, jobCreated: number, delay: number) {
-    const started : OperationPortStarted = { type: OperationPortType.Start, id, jobCreated, delay };
-    write_message(port, started);
+export function refresh_workers(ns: NS) : SchedulerWorker[] {
+    const workers = get_all_controllable_hosts(ns);
+    return workers.map(x => ({
+        host: x,
+        mem: get_server_memory(ns, x),
+        maxMem: get_server_memory_max(ns, x)
+    }));
 }
 
-export function write_message_finished(port: NetscriptPort, id: number, jobFinished: number) {
-    const finished : OperationPortFinished = { type: OperationPortType.Finish, id, jobFinished };
-    write_message(port, finished);
-}
-
-export function read_message(port: NetscriptPort) {
-    return JSON.parse(port.read() as string) as OperationPort;
+export function refresh_targets(ns: NS) {
+    return get_all_hosts(ns).filter(x => ns.getServerMaxMoney(x) > 0)
 }
